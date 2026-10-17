@@ -194,6 +194,27 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         self.tree_mask_mode = default_tree_mask_mode()
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
+        # Share the target's embed/lm_head before the scheduler profiles free
+        # GPU memory for the target KV pool (#44145); draft weights (including
+        # duplicate untied embed/lm_head) are loaded by TpModelWorker.__init__.
+        self._share_embed_and_head_before_kv_sizing()
+
+    def _share_embed_and_head_before_kv_sizing(self) -> None:
+        if getattr(self, "_embed_and_head_shared", False):
+            return
+        draft_model = getattr(self.draft_runner, "model", None)
+        if draft_model is None or not hasattr(draft_model, "set_embed_and_head"):
+            return
+        try:
+            self.init_lm_head()
+        except Exception:
+            logger.exception(
+                "Eager draft embed/lm_head bind failed; retrying deferred bind "
+                "in alloc_memory_pool()."
+            )
+            return
+        self._embed_and_head_shared = True
+
     @property
     def draft_runners(self) -> List[ModelRunner]:
         # One runner per draft step (len == speculative_num_steps).
@@ -213,7 +234,10 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
-        self.init_lm_head()
+        # Skip the deferred bind when __init__ already shared the target's
+        # embed/lm_head before KV pool sizing (#44145).
+        if not getattr(self, "_embed_and_head_shared", False):
+            self.init_lm_head()
         self._init_boundary_kv_fix_state()
 
     def init_attention_backends(self):

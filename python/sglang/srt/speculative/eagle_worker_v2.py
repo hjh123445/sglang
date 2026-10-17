@@ -220,6 +220,38 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
+        # Share the target's embed/lm_head before the scheduler profiles free
+        # GPU memory for the target KV pool (#44145). Draft weights — including
+        # a duplicate embed_tokens/lm_head on untied-embedding models — are
+        # fully loaded by TpModelWorker.__init__ above, so binding here drops
+        # the duplicates from the profiled footprint. alloc_memory_pool()
+        # re-binds no-op via the guard.
+        self._share_embed_and_head_before_kv_sizing()
+
+    def _share_embed_and_head_before_kv_sizing(self) -> None:
+        """Bind target embed/lm_head into the draft eagerly, if possible.
+
+        Falls back silently when the draft model has no set_embed_and_head
+        (the deferred bind in alloc_memory_pool still applies).
+        """
+        if getattr(self, "_embed_and_head_shared", False):
+            return
+        draft_model = getattr(self.draft_runner, "model", None)
+        if draft_model is None or not hasattr(draft_model, "set_embed_and_head"):
+            return
+        try:
+            self.init_token_map()
+            self.init_lm_head()
+        except Exception:
+            # The deferred path in alloc_memory_pool() remains the source of
+            # truth; do not fail startup on an eager bind problem.
+            logger.exception(
+                "Eager draft embed/lm_head bind failed; retrying deferred bind "
+                "in alloc_memory_pool()."
+            )
+            return
+        self._embed_and_head_shared = True
+
     def alloc_memory_pool(
         self,
         memory_pool_config=None,
@@ -234,8 +266,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
-        self.init_token_map()
-        self.init_lm_head()
+        # Skip the deferred bind when __init__ already shared the target's
+        # embed/lm_head before KV pool sizing (#44145).
+        if not getattr(self, "_embed_and_head_shared", False):
+            self.init_token_map()
+            self.init_lm_head()
 
         if get_spec().speculative_use_rejection_sampling:
             target_vocab_size = self.target_worker.model_config.vocab_size
